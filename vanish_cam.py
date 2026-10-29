@@ -55,7 +55,7 @@ MODEL_URLS = {
 
 CALIBRATION_SECONDS = 4.0
 BACKGROUND_SAMPLE_SECONDS = 0.55
-VANISH_SECONDS = 3.6
+VANISH_SECONDS = 0.65
 GESTURE_INTERVAL_SECONDS = 0.14
 
 
@@ -245,13 +245,14 @@ def download_models(mode: str = "normal") -> None:
                 "Controlla la connessione internet e riprova."
             ) from error
 
-
 def open_camera(index: int, width: int, height: int) -> cv2.VideoCapture:
     if platform.system() == "Windows":
         capture = cv2.VideoCapture(index, cv2.CAP_DSHOW)
         if not capture.isOpened():
             capture.release()
             capture = cv2.VideoCapture(index)
+    elif platform.system() == "Darwin":
+        capture = cv2.VideoCapture(index, cv2.CAP_AVFOUNDATION)
     else:
         capture = cv2.VideoCapture(index)
 
@@ -264,7 +265,6 @@ def open_camera(index: int, width: int, height: int) -> cv2.VideoCapture:
     capture.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
     capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
     return capture
-
 
 def create_tasks(mode: str = "normal") -> tuple[vision.ImageSegmenter, MultiViewGestureRecognizer | MultiViewHandLandmarker]:
     segmenter_options = vision.ImageSegmenterOptions(
@@ -379,44 +379,30 @@ def apply_dissolve(
     field: np.ndarray,
     sparkle_noise: np.ndarray,
 ) -> np.ndarray:
+    """Brief Instant Transmission flash, then a clean empty background."""
     if progress <= 0.002:
         return alpha_composite(frame, background, mask)
+
     if progress >= 0.999:
         return background.copy()
 
-    points = cv2.findNonZero((mask > 0.01).astype(np.uint8))
-    if points is None:
-        return background.copy()
-    x, y, width, height = cv2.boundingRect(points)
-    left, top = max(0, x - 18), max(0, y - 18)
-    right = min(mask.shape[1], x + width + 18)
-    bottom = min(mask.shape[0], y + height + 18)
-    area = np.s_[top:bottom, left:right]
-    mask = mask[area]
-    field = field[area]
-    sparkle_noise = sparkle_noise[area]
-    eased = ease_in_out_cubic(progress)
-    survival = smoothstep(eased - 0.055, eased + 0.055, field)
-    alpha = mask * survival
-    output = alpha_composite(frame[area], background[area], alpha)
-    edge = (
-        (np.abs(field - eased) < 0.018)
-        & (mask > 0.48)
-        & (sparkle_noise > 0.54)
-    ).astype(np.float32)
-    glow = cv2.GaussianBlur(edge, (0, 0), sigmaX=5.0, sigmaY=5.0)
-    glow = np.clip(glow * 5.0 + edge, 0.0, 1.0)[:, :, None]
-    cyan = np.full_like(output, (255, 228, 92), dtype=np.uint8)
-    result = np.clip(
-        output.astype(np.float32) * (1.0 - glow * 0.8)
-        + cyan.astype(np.float32) * glow * 0.8,
+    # A very short white flash concentrated on the person's silhouette.
+    # The surrounding room stays unchanged.
+    flash_strength = max(0.0, 1.0 - abs(progress - 0.16) / 0.16)
+    flash_strength = flash_strength ** 2 * 0.72
+
+    alpha = np.clip(mask * flash_strength, 0.0, 0.78)[:, :, None]
+    flashed = np.clip(
+        frame.astype(np.float32) * (1.0 - alpha)
+        + 255.0 * alpha,
         0,
         255,
     ).astype(np.uint8)
-    canvas = background.copy()
-    canvas[area] = result
-    return canvas
 
+    # Quickly reduce the silhouette to the captured empty-room background.
+    survival = 1.0 - smoothstep(0.12, 0.95, progress)
+    remaining_mask = np.clip(mask * survival, 0.0, 1.0)
+    return alpha_composite(flashed, background, remaining_mask)
 
 def victory_landmark_score(points: np.ndarray) -> float:
     """Riconosci indice e medio distesi usando distanze 3D, non l'orientamento."""
@@ -547,13 +533,13 @@ class MultiViewGestureRecognizer:
             if candidate[0] == "Victory":
                 self.preferred_rotation = rotation
                 self.preferred_crop = crop
-                self.next_retry_ms = timestamp_ms + int(GESTURE_INTERVAL_SECONDS * 1000)
+                self.next_retry_ms = timestamp_ms + 300
                 return candidate
             if candidate[0] == "Hand_Detected":
                 best = candidate
         self.preferred_rotation = None
         self.preferred_crop = None
-        self.next_retry_ms = timestamp_ms + int(GESTURE_INTERVAL_SECONDS * 1000)
+        self.next_retry_ms = timestamp_ms + 300
         return best
 
     def close(self) -> None:
@@ -716,6 +702,9 @@ def run_camera(args: argparse.Namespace, resources: ExitStack, mode: str) -> int
     log_anchor: tuple[int, int, int] | None = None
     log_cache: dict[int, np.ndarray] = {}
     vanished_frame: np.ndarray | None = None
+    reappear_frame: np.ndarray | None = None
+    reappear_mask: np.ndarray | None = None
+    gesture_latched = False
     virtual_camera = None
     virtual_camera_initialized = False
     calibration_remaining = None
@@ -776,7 +765,68 @@ def run_camera(args: argparse.Namespace, resources: ExitStack, mode: str) -> int
                     if mode == "naruto" and log_anchor is not None:
                         overlay_log(vanished_frame, log_sprite, landed_log_anchor(log_anchor, height),
                                     cache=log_cache)
-                display = vanished_frame
+
+                # While invisible, watch for a fresh Victory gesture.
+                if (
+                    mode == "normal"
+                    and now - state.last_gesture_check >= GESTURE_INTERVAL_SECONDS
+                ):
+                    state.last_gesture_check = now
+                    rgb = cv2.cvtColor(camera_frame, cv2.COLOR_BGR2RGB)
+                    mp_image = mp.Image(
+                        image_format=mp.ImageFormat.SRGB, data=rgb
+                    )
+                    name, score = recognize_gesture(
+                        recognizer, mp_image, elapsed_ms
+                    )
+
+                    if name != "Victory" or score < 0.62:
+                        gesture_latched = False
+                    elif not gesture_latched:
+                        # Capture the returning person and their silhouette.
+                        reappear_mask = person_mask(
+                            segmenter, mp_image, elapsed_ms, width, height
+                        )
+                        reappear_frame = camera_frame.copy()
+                        state.phase = "reappearing"
+                        state.vanish_started = now
+                        gesture_latched = True
+                        vanished_frame = None
+
+                if state.phase == "vanished":
+                    display = vanished_frame
+                else:
+                    display = background.copy()
+
+            elif state.phase == "reappearing":
+                if (
+                    background is None
+                    or reappear_frame is None
+                    or reappear_mask is None
+                ):
+                    state.phase = "ready"
+                    display = camera_frame
+                else:
+                    progress = min(
+                        1.0,
+                        (now - state.vanish_started) / VANISH_SECONDS
+                        if state.vanish_started is not None else 1.0,
+                    )
+                    # Reverse the same dissolve over the same duration.
+                    display = apply_dissolve(
+                        reappear_frame,
+                        background,
+                        reappear_mask,
+                        1.0 - progress,
+                        dissolve_field,
+                        sparkle_noise,
+                    )
+                    if progress >= 1.0:
+                        state.phase = "ready"
+                        state.vanish_started = None
+                        vanished_frame = None
+                        last_mask = reappear_mask
+                        last_mask_at = now
 
             else:
                 mask = last_mask
@@ -797,7 +847,13 @@ def run_camera(args: argparse.Namespace, resources: ExitStack, mode: str) -> int
                                 f"rotazione={recognizer.preferred_rotation or 0}"
                             )
                             last_gesture_report = now
-                        start_vanish_on_gesture(state, name, score, now)
+                        if name == "Victory" and score >= 0.62:
+                            if not gesture_latched:
+                                start_vanish_on_gesture(state, name, score, now)
+                                if state.phase == "vanishing":
+                                    gesture_latched = True
+                        else:
+                            gesture_latched = False
                     else:
                         joined = recognizer.recognize_joined_hands(mp_image, elapsed_ms)
                         if args.gesture_debug and now - last_gesture_report >= 1.0:
@@ -811,14 +867,20 @@ def run_camera(args: argparse.Namespace, resources: ExitStack, mode: str) -> int
                     # Normal dissolve tracks the silhouette at 20 Hz; Naruto
                     # needs it only while the person is still visible.
                     needs_mask = (
-                        (mode == "normal" and (mask is None or now - last_mask_at >= 0.05))
+                        (mode == "normal" and (mask is None or now - last_mask_at >= 0.08))
                         or (mode == "naruto" and (log_anchor is None or now - state.vanish_started < 0.13))
                     )
                     if needs_mask:
                         if mp_image is None:
                             rgb = cv2.cvtColor(camera_frame, cv2.COLOR_BGR2RGB)
                             mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-                        mask = person_mask(segmenter, mp_image, elapsed_ms, width, height)
+                        new_mask = person_mask(
+                            segmenter, mp_image, elapsed_ms, width, height
+                        )
+                        if mode == "normal" and mask is not None:
+                            mask = cv2.addWeighted(new_mask, 0.65, mask, 0.35, 0)
+                        else:
+                            mask = new_mask
                         last_mask = mask
                         last_mask_at = now
                     if mode == "naruto" and log_anchor is None:
@@ -846,7 +908,7 @@ def run_camera(args: argparse.Namespace, resources: ExitStack, mode: str) -> int
                         camera_frame, background, mask, progress, dissolve_field, sparkle_noise
                     )
                     if state.phase == "vanished":
-                        vanished_frame = display
+                        vanished_frame = background.copy()
 
             if virtual_camera is not None:
                 send_virtual_frame(virtual_camera, display)
